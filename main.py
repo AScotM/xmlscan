@@ -2,11 +2,10 @@
 
 import argparse
 import json
-import os
 import sys
 import xml.parsers.expat
 from collections import Counter, defaultdict
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,17 +33,36 @@ class PathStat:
 
 
 @dataclass
-class ParseReport:
+class DocumentInfo:
     source: str
     bytes_read: int
+    root_element: Optional[str]
+    encoding: Optional[str]
+    standalone: Optional[int]
+
+
+@dataclass
+class SummaryStats:
     total_elements: int
     unique_elements: int
     total_attributes: int
     unique_paths: int
     max_depth: int
-    root_element: Optional[str]
-    encoding: Optional[str]
-    standalone: Optional[int]
+
+
+@dataclass
+class DerivedStats:
+    avg_attributes_per_element: float
+    avg_paths_per_element: float
+    captured_text_samples: int
+    note_count: int
+
+
+@dataclass
+class ParseReport:
+    document: DocumentInfo
+    summary: SummaryStats
+    derived: DerivedStats
     element_stats: List[ElementStat]
     path_stats: List[PathStat]
     text_samples: List[TextSample]
@@ -217,17 +235,30 @@ class XMLStreamAnalyzer:
         if self.encoding is None:
             self.notes.append("xml declaration not present or encoding unspecified")
 
+        avg_attributes_per_element = self.total_attributes / self.total_elements if self.total_elements else 0.0
+        avg_paths_per_element = len(self.path_counts) / self.total_elements if self.total_elements else 0.0
+
         return ParseReport(
-            source=self.source,
-            bytes_read=self.bytes_read,
-            total_elements=self.total_elements,
-            unique_elements=len(self.element_counts),
-            total_attributes=self.total_attributes,
-            unique_paths=len(self.path_counts),
-            max_depth=self.max_depth,
-            root_element=self.root_element,
-            encoding=self.encoding,
-            standalone=self.standalone,
+            document=DocumentInfo(
+                source=self.source,
+                bytes_read=self.bytes_read,
+                root_element=self.root_element,
+                encoding=self.encoding,
+                standalone=self.standalone,
+            ),
+            summary=SummaryStats(
+                total_elements=self.total_elements,
+                unique_elements=len(self.element_counts),
+                total_attributes=self.total_attributes,
+                unique_paths=len(self.path_counts),
+                max_depth=self.max_depth,
+            ),
+            derived=DerivedStats(
+                avg_attributes_per_element=avg_attributes_per_element,
+                avg_paths_per_element=avg_paths_per_element,
+                captured_text_samples=len(self.text_samples),
+                note_count=len(self.notes),
+            ),
             element_stats=element_stats,
             path_stats=path_stats,
             text_samples=self.text_samples,
@@ -266,13 +297,34 @@ def frame_line(text: str, width: int) -> str:
 
 def print_summary(report: ParseReport, width: int = 120) -> None:
     print(frame_top(width))
-    print(frame_line(f"XML STREAM ANALYSIS  source={report.source}", width))
+    print(frame_line(f"XML STREAM ANALYSIS  source={report.document.source}", width))
     print(frame_mid(width))
-    print(frame_line(f"bytes_read={report.bytes_read} ({format_bytes(report.bytes_read)})", width))
-    print(frame_line(f"root_element={report.root_element or 'N/A'}", width))
-    print(frame_line(f"encoding={report.encoding or 'N/A'}  standalone={report.standalone if report.standalone is not None else 'N/A'}", width))
-    print(frame_line(f"total_elements={report.total_elements}  unique_elements={report.unique_elements}", width))
-    print(frame_line(f"total_attributes={report.total_attributes}  unique_paths={report.unique_paths}  max_depth={report.max_depth}", width))
+    print(frame_line(f"bytes_read={report.document.bytes_read} ({format_bytes(report.document.bytes_read)})", width))
+    print(frame_line(f"root_element={report.document.root_element or 'N/A'}", width))
+    print(
+        frame_line(
+            f"encoding={report.document.encoding or 'N/A'}  standalone={report.document.standalone if report.document.standalone is not None else 'N/A'}",
+            width,
+        )
+    )
+    print(
+        frame_line(
+            f"total_elements={report.summary.total_elements}  unique_elements={report.summary.unique_elements}",
+            width,
+        )
+    )
+    print(
+        frame_line(
+            f"total_attributes={report.summary.total_attributes}  unique_paths={report.summary.unique_paths}  max_depth={report.summary.max_depth}",
+            width,
+        )
+    )
+    print(
+        frame_line(
+            f"avg_attributes_per_element={report.derived.avg_attributes_per_element:.4f}  avg_paths_per_element={report.derived.avg_paths_per_element:.4f}",
+            width,
+        )
+    )
     if report.notes:
         print(frame_mid(width))
         for note in report.notes:
@@ -316,11 +368,12 @@ def print_text_samples(report: ParseReport, limit: int = 10, width: int = 120) -
         print(frame_bottom(width))
         return
 
-    for sample in report.text_samples[:limit]:
+    for idx, sample in enumerate(report.text_samples[:limit]):
         print(frame_line(f"path={sample.path}", width))
         text = sample.text.replace("\n", "\\n").replace("\r", "\\r")
         print(frame_line(f"text={text}", width))
-        print(frame_mid(width))
+        if idx != min(limit, len(report.text_samples)) - 1:
+            print(frame_mid(width))
     print(frame_bottom(width))
 
 
@@ -332,11 +385,99 @@ def report_to_compact_json(report: ParseReport) -> str:
     return json.dumps(asdict(report), separators=(",", ":"), ensure_ascii=False)
 
 
+def report_to_structured_text(report: ParseReport, element_limit: int, path_limit: int, sample_limit: int) -> str:
+    lines: List[str] = []
+
+    lines.append("[document]")
+    lines.append(f"source={report.document.source}")
+    lines.append(f"bytes_read={report.document.bytes_read}")
+    lines.append(f"bytes_human={format_bytes(report.document.bytes_read)}")
+    lines.append(f"root_element={report.document.root_element or 'N/A'}")
+    lines.append(f"encoding={report.document.encoding or 'N/A'}")
+    lines.append(f"standalone={report.document.standalone if report.document.standalone is not None else 'N/A'}")
+    lines.append("")
+
+    lines.append("[summary]")
+    lines.append(f"total_elements={report.summary.total_elements}")
+    lines.append(f"unique_elements={report.summary.unique_elements}")
+    lines.append(f"total_attributes={report.summary.total_attributes}")
+    lines.append(f"unique_paths={report.summary.unique_paths}")
+    lines.append(f"max_depth={report.summary.max_depth}")
+    lines.append("")
+
+    lines.append("[derived]")
+    lines.append(f"avg_attributes_per_element={report.derived.avg_attributes_per_element:.6f}")
+    lines.append(f"avg_paths_per_element={report.derived.avg_paths_per_element:.6f}")
+    lines.append(f"captured_text_samples={report.derived.captured_text_samples}")
+    lines.append(f"note_count={report.derived.note_count}")
+    lines.append("")
+
+    lines.append("[elements]")
+    if report.element_stats[:element_limit]:
+        for stat in report.element_stats[:element_limit]:
+            attr_keys = ",".join(stat.attribute_keys) if stat.attribute_keys else "-"
+            lines.append(
+                f"name={stat.name} count={stat.count} max_depth={stat.max_depth} text_nodes={stat.text_nodes} attr_keys={attr_keys}"
+            )
+    else:
+        lines.append("none")
+    lines.append("")
+
+    lines.append("[paths]")
+    if report.path_stats[:path_limit]:
+        for stat in report.path_stats[:path_limit]:
+            lines.append(f"count={stat.count} path={stat.path}")
+    else:
+        lines.append("none")
+    lines.append("")
+
+    lines.append("[text_samples]")
+    if report.text_samples[:sample_limit]:
+        for sample in report.text_samples[:sample_limit]:
+            text = sample.text.replace("\n", "\\n").replace("\r", "\\r")
+            lines.append(f"path={sample.path} text={text}")
+    else:
+        lines.append("none")
+    lines.append("")
+
+    lines.append("[notes]")
+    if report.notes:
+        for note in report.notes:
+            lines.append(note)
+    else:
+        lines.append("none")
+
+    return "\n".join(lines) + "\n"
+
+
+def report_to_ndjson(report: ParseReport, element_limit: Optional[int] = None, path_limit: Optional[int] = None, sample_limit: Optional[int] = None) -> str:
+    lines: List[str] = []
+
+    lines.append(json.dumps({"type": "document", **asdict(report.document)}, ensure_ascii=False))
+    lines.append(json.dumps({"type": "summary", **asdict(report.summary)}, ensure_ascii=False))
+    lines.append(json.dumps({"type": "derived", **asdict(report.derived)}, ensure_ascii=False))
+
+    for stat in report.element_stats[:element_limit] if element_limit is not None else report.element_stats:
+        lines.append(json.dumps({"type": "element_stat", **asdict(stat)}, ensure_ascii=False))
+
+    for stat in report.path_stats[:path_limit] if path_limit is not None else report.path_stats:
+        lines.append(json.dumps({"type": "path_stat", **asdict(stat)}, ensure_ascii=False))
+
+    for sample in report.text_samples[:sample_limit] if sample_limit is not None else report.text_samples:
+        lines.append(json.dumps({"type": "text_sample", **asdict(sample)}, ensure_ascii=False))
+
+    for note in report.notes:
+        lines.append(json.dumps({"type": "note", "text": note}, ensure_ascii=False))
+
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def report_to_text(report: ParseReport, element_limit: int, path_limit: int, sample_limit: int, width: int) -> str:
     parts: List[str] = []
 
-    def capture(fn) -> str:
+    def capture(fn: Any) -> str:
         from io import StringIO
+
         old_stdout = sys.stdout
         buf = StringIO()
         try:
@@ -368,6 +509,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 Examples:
   %(prog)s file.xml
   %(prog)s file.xml --json
+  %(prog)s file.xml --compact-json
+  %(prog)s file.xml --structured-text
+  %(prog)s file.xml --ndjson
   %(prog)s file.xml --json --output report.json
   %(prog)s file.xml --elements 50 --paths 50 --samples 20
   %(prog)s --string "<root><item id='1'>alpha</item></root>"
@@ -377,6 +521,8 @@ Examples:
     parser.add_argument("--string", dest="xml_string", help="Analyze XML string input directly")
     parser.add_argument("--json", action="store_true", help="Print formatted JSON")
     parser.add_argument("--compact-json", action="store_true", help="Print compact JSON")
+    parser.add_argument("--structured-text", action="store_true", help="Print sectioned structured text")
+    parser.add_argument("--ndjson", action="store_true", help="Print line-delimited JSON")
     parser.add_argument("--output", help="Write output to file")
     parser.add_argument("--elements", type=int, default=20, help="Max element stats to show in text mode")
     parser.add_argument("--paths", type=int, default=20, help="Max path stats to show in text mode")
@@ -415,6 +561,17 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.chunk_size < 1:
         raise ValueError("--chunk-size must be positive")
 
+    selected_formats = sum(
+        [
+            1 if args.json else 0,
+            1 if args.compact_json else 0,
+            1 if args.structured_text else 0,
+            1 if args.ndjson else 0,
+        ]
+    )
+    if selected_formats > 1:
+        raise ValueError("choose only one of --json, --compact-json, --structured-text, --ndjson")
+
 
 def main() -> int:
     parser = build_arg_parser()
@@ -440,6 +597,20 @@ def main() -> int:
             output = report_to_compact_json(report)
         elif args.json:
             output = report_to_json(report)
+        elif args.structured_text:
+            output = report_to_structured_text(
+                report,
+                element_limit=args.elements,
+                path_limit=args.paths,
+                sample_limit=args.samples,
+            )
+        elif args.ndjson:
+            output = report_to_ndjson(
+                report,
+                element_limit=args.elements,
+                path_limit=args.paths,
+                sample_limit=args.samples,
+            )
         else:
             output = report_to_text(
                 report,
