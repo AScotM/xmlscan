@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-
 import argparse
+import csv
+import hashlib
+import io
+import os
+import tempfile
 import json
 import sys
 import time
@@ -8,7 +12,7 @@ import xml.parsers.expat
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, TextIO
+from typing import Dict, List, Optional
 
 
 class XMLScanError(Exception):
@@ -83,16 +87,20 @@ class ParseReport:
     path_stats: List[PathStat]
     text_samples: List[TextSample]
     notes: List[str] = field(default_factory=list)
+    diagnostics: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
 class AnalyzerLimits:
-    max_bytes: Optional[int] = None
-    max_elements: Optional[int] = None
-    max_depth: Optional[int] = None
+    max_bytes: Optional[int] = 67108864
+    max_elements: Optional[int] = 2000000
+    max_depth: Optional[int] = 256
     max_text_bytes: Optional[int] = None
-    max_unique_elements: Optional[int] = None
-    max_unique_paths: Optional[int] = None
+    max_unique_elements: Optional[int] = 100000
+    max_unique_paths: Optional[int] = 200000
+    max_attributes: Optional[int] = 2000000
+    max_attribute_bytes: Optional[int] = 1048576
+    max_name_bytes: Optional[int] = 4096
 
 
 class XMLStreamAnalyzer:
@@ -129,6 +137,29 @@ class XMLStreamAnalyzer:
         self.path_stack: List[str] = []
         self.text_buffer_stack: List[List[str]] = []
         self.text_buffer_sizes: List[int] = []
+        self.text_buffer_truncated = False
+        self.max_retained_text_bytes = 0
+        self.depth_counts: Counter[int] = Counter()
+        self.attribute_count_distribution: Counter[int] = Counter()
+        self.children_per_parent: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.element_parent_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.leaf_elements: Counter[str] = Counter()
+        self.empty_elements: Counter[str] = Counter()
+        self.direct_child_count_total = 0
+        self.direct_child_count_max = 0
+        self.completed_elements = 0
+        self.element_child_stack: List[int] = []
+        self.element_direct_text_stack: List[bool] = []
+        self.total_character_bytes = 0
+        self.total_character_callbacks = 0
+        self.max_attributes_on_element = 0
+        self.document_digest = hashlib.sha256()
+        self.xml_declaration_version: Optional[str] = None
+        self.comment_count = 0
+        self.processing_instruction_count = 0
+        self.cdata_sections = 0
+        self.doctype_count = 0
+        self.total_text_truncations = 0
         self.element_counts: Counter[str] = Counter()
         self.path_counts: Counter[str] = Counter()
         self.element_max_depth: Dict[str, int] = defaultdict(int)
@@ -195,11 +226,28 @@ class XMLStreamAnalyzer:
         encoding: Optional[str],
         standalone: int,
     ) -> None:
+        self.xml_declaration_version = version
         if encoding:
             self.encoding = encoding
         self.standalone = standalone
 
     def _on_start(self, name: str, attrs: Dict[str, str]) -> None:
+        if self.limits.max_name_bytes is not None:
+            if len(name.encode("utf-8")) > self.limits.max_name_bytes:
+                raise ResourceLimitError("maximum XML element name size exceeded")
+        if self.limits.max_attribute_bytes is not None:
+            for key, value in attrs.items():
+                if len(key.encode("utf-8")) + len(value.encode("utf-8")) > self.limits.max_attribute_bytes:
+                    raise ResourceLimitError("maximum XML attribute size exceeded")
+        if self.limits.max_attributes is not None:
+            if self.total_attributes + len(attrs) > self.limits.max_attributes:
+                raise ResourceLimitError("maximum XML attribute count exceeded")
+        if self.element_child_stack:
+            self.element_child_stack[-1] += 1
+            self.children_per_parent[self.path_stack[-1]][name] += 1
+            self.element_parent_counts[name][self.path_stack[-1]] += 1
+        self.element_child_stack.append(0)
+        self.element_direct_text_stack.append(False)
         self.path_stack.append(name)
         self.text_buffer_stack.append([])
         self.text_buffer_sizes.append(0)
@@ -228,6 +276,9 @@ class XMLStreamAnalyzer:
             self._check_unique_path_limit()
 
         self.total_attributes += len(attrs)
+        self.depth_counts[depth] += 1
+        self.attribute_count_distribution[len(attrs)] += 1
+        self.max_attributes_on_element = max(self.max_attributes_on_element, len(attrs))
 
         if depth > self.max_depth:
             self.max_depth = depth
@@ -259,6 +310,15 @@ class XMLStreamAnalyzer:
                 f"parser stack mismatch: expected {current_name}, received {name}"
             )
 
+        child_count = self.element_child_stack.pop()
+        direct_text = self.element_direct_text_stack.pop()
+        self.direct_child_count_total += child_count
+        self.direct_child_count_max = max(self.direct_child_count_max, child_count)
+        self.completed_elements += 1
+        if child_count == 0:
+            self.leaf_elements[name] += 1
+        if child_count == 0 and not direct_text:
+            self.empty_elements[name] += 1
         text = "".join(pieces)
 
         if self.strip_text:
@@ -272,41 +332,61 @@ class XMLStreamAnalyzer:
         if not self.text_buffer_stack or not data:
             return
 
-        encoded_size = len(data.encode("utf-8"))
+        self.total_character_callbacks += 1
+        encoded = data.encode("utf-8")
+        encoded_size = len(encoded)
+        self.total_character_bytes += encoded_size
+        if data.strip():
+            self.element_direct_text_stack[-1] = True
 
-        for index in range(len(self.text_buffer_stack)):
-            limit = self.limits.max_text_bytes
+        if len(self.text_samples) >= self.max_text_samples:
+            return
 
-            if (
-                limit is not None
-                and self.text_buffer_sizes[index] + encoded_size > limit
-            ):
-                remaining = limit - self.text_buffer_sizes[index]
+        limit = self.limits.max_text_bytes
+        if limit is None:
+            limit = 4096
 
-                if remaining <= 0:
-                    continue
+        index = len(self.text_buffer_stack) - 1
+        current_size = self.text_buffer_sizes[index]
+        remaining = max(0, limit - current_size)
 
-                encoded = data.encode("utf-8")[:remaining]
+        if remaining == 0:
+            self.text_buffer_truncated = True
+            self.total_text_truncations += 1
+            return
 
-                while encoded:
-                    try:
-                        partial = encoded.decode("utf-8")
-                        break
-                    except UnicodeDecodeError:
-                        encoded = encoded[:-1]
-                else:
-                    partial = ""
+        if encoded_size > remaining:
+            encoded = encoded[:remaining]
+            while encoded:
+                try:
+                    data = encoded.decode("utf-8")
+                    break
+                except UnicodeDecodeError:
+                    encoded = encoded[:-1]
+            else:
+                data = ""
+            self.text_buffer_truncated = True
+            self.total_text_truncations += 1
 
-                if partial:
-                    self.text_buffer_stack[index].append(partial)
-                    self.text_buffer_sizes[index] += len(
-                        partial.encode("utf-8")
-                    )
-
-                continue
-
+        if data:
             self.text_buffer_stack[index].append(data)
-            self.text_buffer_sizes[index] += encoded_size
+            self.text_buffer_sizes[index] += len(data.encode("utf-8"))
+            self.max_retained_text_bytes = max(
+                self.max_retained_text_bytes,
+                self.text_buffer_sizes[index],
+            )
+
+    def _on_comment(self, data: str) -> None:
+        self.comment_count += 1
+
+    def _on_processing_instruction(self, target: str, data: str) -> None:
+        self.processing_instruction_count += 1
+
+    def _on_cdata_start(self) -> None:
+        self.cdata_sections += 1
+
+    def _on_doctype(self, name: str, sysid: Optional[str], pubid: Optional[str], has_internal_subset: int) -> None:
+        self.doctype_count += 1
 
     def _on_external_entity(
         self,
@@ -342,6 +422,10 @@ class XMLStreamAnalyzer:
         parser.CharacterDataHandler = self._on_char_data
         parser.ExternalEntityRefHandler = self._on_external_entity
         parser.SkippedEntityHandler = self._on_skipped_entity
+        parser.CommentHandler = self._on_comment
+        parser.ProcessingInstructionHandler = self._on_processing_instruction
+        parser.StartCdataSectionHandler = self._on_cdata_start
+        parser.StartDoctypeDeclHandler = self._on_doctype
 
         parser.SetParamEntityParsing(
             xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER
@@ -376,6 +460,7 @@ class XMLStreamAnalyzer:
             if isinstance(chunk, str):
                 chunk = chunk.encode("utf-8")
 
+            self.document_digest.update(chunk)
             self.bytes_read += len(chunk)
             self._check_byte_limit()
             parser.Parse(chunk, False)
@@ -424,12 +509,46 @@ class XMLStreamAnalyzer:
         parser = self._begin(source)
         data = xml_text.encode("utf-8")
 
+        self.document_digest.update(data)
         self.bytes_read = len(data)
         self._check_byte_limit()
 
         parser.Parse(data, True)
 
         return self._finish()
+
+    def _build_diagnostics(self) -> Dict[str, object]:
+        return {
+            "sha256": self.document_digest.hexdigest(),
+            "xml_version": self.xml_declaration_version,
+            "depth_distribution": dict(sorted(self.depth_counts.items())),
+            "attribute_count_distribution": dict(sorted(self.attribute_count_distribution.items())),
+            "max_attributes_on_element": self.max_attributes_on_element,
+            "total_character_bytes": self.total_character_bytes,
+            "character_data_callbacks": self.total_character_callbacks,
+            "max_retained_text_bytes": self.max_retained_text_bytes,
+            "text_sample_truncated": self.text_buffer_truncated,
+            "text_truncation_events": self.total_text_truncations,
+            "comment_count": self.comment_count,
+            "processing_instruction_count": self.processing_instruction_count,
+            "cdata_sections": self.cdata_sections,
+            "doctype_count": self.doctype_count,
+            "leaf_elements": dict(self.leaf_elements.most_common(100)),
+            "empty_elements": dict(self.empty_elements.most_common(100)),
+            "average_children_per_element": (
+                self.direct_child_count_total / self.completed_elements
+                if self.completed_elements else 0.0
+            ),
+            "max_children_per_element": self.direct_child_count_max,
+            "children_by_element": {
+                name: dict(children.most_common(20))
+                for name, children in sorted(self.children_per_parent.items())
+            },
+            "parents_by_element": {
+                name: dict(parents.most_common(20))
+                for name, parents in sorted(self.element_parent_counts.items())
+            },
+        }
 
     def _build_report(self) -> ParseReport:
         element_stats: List[ElementStat] = []
@@ -474,16 +593,10 @@ class XMLStreamAnalyzer:
                 "XML declaration absent or no explicit encoding declared"
             )
 
-        if self.limits.max_text_bytes is not None:
-            truncated = any(
-                size >= self.limits.max_text_bytes
-                for size in self.text_buffer_sizes
+        if self.text_buffer_truncated:
+            self.notes.append(
+                "one or more text samples were truncated to the configured retention limit"
             )
-
-            if truncated:
-                self.notes.append(
-                    "one or more text buffers reached the configured limit"
-                )
 
         avg_attributes_per_element = (
             self.total_attributes / self.total_elements
@@ -538,6 +651,7 @@ class XMLStreamAnalyzer:
             path_stats=path_stats,
             text_samples=list(self.text_samples),
             notes=list(self.notes),
+            diagnostics=self._build_diagnostics(),
         )
 
 
@@ -1053,28 +1167,352 @@ def report_to_ndjson(
     return "\n".join(lines) + "\n"
 
 
-def write_output(
-    path: str,
-    data: str,
-) -> None:
-    target = Path(path)
+def report_to_csv(report: ParseReport) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "record_type",
+        "name",
+        "path",
+        "count",
+        "depth",
+        "text_nodes",
+        "attributes",
+        "value",
+    ])
 
-    if target.parent != Path("."):
-        target.parent.mkdir(
-            parents=True,
-            exist_ok=True,
+    for stat in report.element_stats:
+        writer.writerow([
+            "element",
+            stat.name,
+            "",
+            stat.count,
+            stat.max_depth,
+            stat.text_nodes,
+            ";".join(stat.attribute_keys),
+            "",
+        ])
+
+    for stat in report.path_stats:
+        writer.writerow([
+            "path",
+            "",
+            stat.path,
+            stat.count,
+            "",
+            "",
+            "",
+            "",
+        ])
+
+    for sample in report.text_samples:
+        writer.writerow([
+            "text",
+            "",
+            sample.path,
+            "",
+            "",
+            "",
+            "",
+            sample.text,
+        ])
+
+    for key, value in sorted(report.diagnostics.items()):
+        if isinstance(value, (dict, list)):
+            encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            encoded = str(value)
+        writer.writerow([
+            "diagnostic",
+            key,
+            "",
+            "",
+            "",
+            "",
+            "",
+            encoded,
+        ])
+
+    for note in report.notes:
+        writer.writerow([
+            "note",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            note,
+        ])
+
+    return buffer.getvalue()
+
+
+def markdown_escape(value: object) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
+
+
+def report_to_markdown(
+    report: ParseReport,
+    element_limit: int,
+    path_limit: int,
+    sample_limit: int,
+) -> str:
+    lines = [
+        "# XML analysis",
+        "",
+        "## Document",
+        "",
+        "| Property | Value |",
+        "| --- | --- |",
+    ]
+
+    properties = {
+        "Source": report.document.source,
+        "Root element": report.document.root_element or "N/A",
+        "Bytes read": report.document.bytes_read,
+        "Encoding": report.document.encoding or "N/A",
+        "Total elements": report.summary.total_elements,
+        "Unique elements": report.summary.unique_elements,
+        "Total attributes": report.summary.total_attributes,
+        "Unique paths": report.summary.unique_paths,
+        "Maximum depth": report.summary.max_depth,
+        "Elapsed seconds": f"{report.derived.elapsed_seconds:.6f}",
+        "SHA-256": report.diagnostics.get("sha256", "N/A"),
+    }
+
+    for key, value in properties.items():
+        lines.append(
+            f"| {markdown_escape(key)} | {markdown_escape(value)} |"
         )
 
-    temporary = target.with_name(
-        target.name + ".tmp"
-    )
+    lines.extend([
+        "",
+        "## Elements",
+        "",
+        "| Name | Count | Maximum depth | Text nodes | Attributes |",
+        "| --- | ---: | ---: | ---: | --- |",
+    ])
 
-    temporary.write_text(
-        data,
-        encoding="utf-8",
-    )
+    for stat in report.element_stats[:element_limit]:
+        lines.append(
+            f"| {markdown_escape(stat.name)} "
+            f"| {stat.count} "
+            f"| {stat.max_depth} "
+            f"| {stat.text_nodes} "
+            f"| {markdown_escape(', '.join(stat.attribute_keys))} |"
+        )
 
-    temporary.replace(target)
+    lines.extend([
+        "",
+        "## Paths",
+        "",
+        "| Path | Count |",
+        "| --- | ---: |",
+    ])
+
+    for stat in report.path_stats[:path_limit]:
+        lines.append(
+            f"| {markdown_escape(stat.path)} | {stat.count} |"
+        )
+
+    lines.extend([
+        "",
+        "## Text samples",
+        "",
+        "| Path | Text |",
+        "| --- | --- |",
+    ])
+
+    for sample in report.text_samples[:sample_limit]:
+        lines.append(
+            f"| {markdown_escape(sample.path)} "
+            f"| {markdown_escape(sample.text)} |"
+        )
+
+    if report.notes:
+        lines.extend([
+            "",
+            "## Notes",
+            "",
+        ])
+        for note in report.notes:
+            lines.append(f"- {note}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def report_to_schema(report: ParseReport) -> str:
+    element_definitions = {}
+    parent_map = report.diagnostics.get("parents_by_element", {})
+    children_map = report.diagnostics.get("children_by_element", {})
+    leaf_map = report.diagnostics.get("leaf_elements", {})
+    empty_map = report.diagnostics.get("empty_elements", {})
+
+    for stat in report.element_stats:
+        name = stat.name
+        attribute_definitions = {}
+
+        for attribute in stat.attribute_keys:
+            values = stat.attribute_value_samples.get(attribute, [])
+            attribute_definitions[attribute] = {
+                "type": "string",
+                "observed_values": values,
+                "sample_count": len(values),
+            }
+
+        element_definitions[name] = {
+            "occurrences": stat.count,
+            "maximum_depth": stat.max_depth,
+            "text_occurrences": stat.text_nodes,
+            "leaf_occurrences": leaf_map.get(name, 0),
+            "empty_occurrences": empty_map.get(name, 0),
+            "attributes": attribute_definitions,
+            "observed_children": children_map.get(name, {}),
+            "observed_parents": parent_map.get(name, {}),
+        }
+
+    document = {
+        "schema_kind": "observed_xml_structure",
+        "schema_version": 1,
+        "source": report.document.source,
+        "root_element": report.document.root_element,
+        "namespace_aware": report.document.namespace_aware,
+        "element_definitions": element_definitions,
+        "limitations": [
+            "Inferred from one XML document",
+            "Not an XML Schema Definition (XSD)",
+            "Attribute samples do not imply a complete enumeration",
+            "Observed children do not establish occurrence constraints",
+        ],
+    }
+
+    return json.dumps(
+        document,
+        indent=2,
+        ensure_ascii=False,
+        sort_keys=True,
+    ) + "\n"
+
+
+def summarize_diagnostics(report: ParseReport) -> str:
+    diagnostics = report.diagnostics
+    lines = [
+        "XML DIAGNOSTICS",
+        f"SHA-256: {diagnostics.get('sha256', 'N/A')}",
+        f"XML version: {diagnostics.get('xml_version', 'N/A')}",
+        f"Comments: {diagnostics.get('comment_count', 0)}",
+        f"CDATA sections: {diagnostics.get('cdata_sections', 0)}",
+        f"Processing instructions: {diagnostics.get('processing_instruction_count', 0)}",
+        f"Character callbacks: {diagnostics.get('character_data_callbacks', 0)}",
+        f"Character bytes: {diagnostics.get('total_character_bytes', 0)}",
+        f"Text truncated: {diagnostics.get('text_sample_truncated', False)}",
+        f"Maximum children: {diagnostics.get('max_children_per_element', 0)}",
+        f"Maximum attributes: {diagnostics.get('max_attributes_on_element', 0)}",
+    ]
+
+    depths = diagnostics.get("depth_distribution", {})
+    if isinstance(depths, dict):
+        lines.append("Depth distribution:")
+        for depth, count in sorted(depths.items(), key=lambda item: int(item[0])):
+            lines.append(f"  {depth}: {count}")
+
+    return "\n".join(lines) + "\n"
+
+
+def safe_atomic_write(path: str, data: str) -> None:
+    target = Path(path)
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_name = stream.name
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        os.replace(temporary_name, target)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
+def validate_report(report: ParseReport) -> List[str]:
+    issues = []
+    element_sum = sum(stat.count for stat in report.element_stats)
+    path_sum = sum(report.diagnostics.get("depth_distribution", {}).values())
+
+    if element_sum != report.summary.total_elements:
+        issues.append("element statistics do not match total element count")
+
+    if path_sum != report.summary.total_elements:
+        issues.append("depth distribution does not match total element count")
+
+    if report.summary.unique_elements != len(report.element_stats):
+        issues.append("unique element count is inconsistent")
+
+    if report.summary.total_elements > 0 and not report.document.root_element:
+        issues.append("root element missing from a nonempty document")
+
+    if report.summary.max_depth < 1 and report.summary.total_elements:
+        issues.append("maximum depth is invalid")
+
+    if report.document.bytes_read < 0:
+        issues.append("negative byte count")
+
+    if report.derived.captured_text_samples != len(report.text_samples):
+        issues.append("text sample count mismatch")
+
+    return issues
+
+
+def render_validation_result(report: ParseReport) -> str:
+    issues = validate_report(report)
+    if not issues:
+        return "Report validation: PASS\n"
+
+    return "Report validation: FAIL\n" + "\n".join(
+        f"  {issue}" for issue in issues
+    ) + "\n"
+
+
+def report_to_diagnostics_json(report: ParseReport) -> str:
+    payload = {
+        "source": report.document.source,
+        "summary": asdict(report.summary),
+        "diagnostics": report.diagnostics,
+        "validation_issues": validate_report(report),
+    }
+    return json.dumps(
+        payload,
+        indent=2,
+        ensure_ascii=False,
+        sort_keys=True,
+    ) + "\n"
+
+def write_output(path: str, data: str) -> None:
+    safe_atomic_write(path, data)
 
 
 def positive_int(value: str) -> int:
@@ -1139,6 +1577,11 @@ Examples:
             "compact-json",
             "structured",
             "ndjson",
+            "csv",
+            "markdown",
+            "schema",
+            "diagnostics-json",
+            "diagnostics",
         ],
         default="text",
         help="Output format",
@@ -1285,6 +1728,24 @@ Examples:
     )
 
     parser.add_argument(
+        "--max-attributes",
+        type=positive_int,
+        help="Maximum total XML attributes",
+    )
+
+    parser.add_argument(
+        "--max-attribute-bytes",
+        type=positive_int,
+        help="Maximum bytes for one attribute name and value",
+    )
+
+    parser.add_argument(
+        "--max-name-bytes",
+        type=positive_int,
+        help="Maximum bytes for one XML element name",
+    )
+
+    parser.add_argument(
         "--max-unique-paths",
         type=positive_int,
         help="Maximum number of unique XML paths",
@@ -1354,12 +1815,15 @@ def build_analyzer(
     args: argparse.Namespace,
 ) -> XMLStreamAnalyzer:
     limits = AnalyzerLimits(
-        max_bytes=args.max_bytes,
-        max_elements=args.max_elements,
-        max_depth=args.max_depth,
+        max_bytes=args.max_bytes if args.max_bytes is not None else 67108864,
+        max_elements=args.max_elements if args.max_elements is not None else 2000000,
+        max_depth=args.max_depth if args.max_depth is not None else 256,
         max_text_bytes=args.max_text_bytes,
-        max_unique_elements=args.max_unique_elements,
-        max_unique_paths=args.max_unique_paths,
+        max_unique_elements=args.max_unique_elements if args.max_unique_elements is not None else 100000,
+        max_unique_paths=args.max_unique_paths if args.max_unique_paths is not None else 200000,
+        max_attributes=args.max_attributes if args.max_attributes is not None else 2000000,
+        max_attribute_bytes=args.max_attribute_bytes if args.max_attribute_bytes is not None else 1048576,
+        max_name_bytes=args.max_name_bytes if args.max_name_bytes is not None else 4096,
     )
 
     return XMLStreamAnalyzer(
@@ -1399,6 +1863,26 @@ def render_report(
     output_format: str,
     args: argparse.Namespace,
 ) -> str:
+    if output_format == "csv":
+        return report_to_csv(report)
+
+    if output_format == "markdown":
+        return report_to_markdown(
+            report,
+            element_limit=args.elements,
+            path_limit=args.paths,
+            sample_limit=args.samples,
+        )
+
+    if output_format == "schema":
+        return report_to_schema(report)
+
+    if output_format == "diagnostics":
+        return summarize_diagnostics(report)
+
+    if output_format == "diagnostics-json":
+        return report_to_diagnostics_json(report)
+
     if output_format == "json":
         return report_to_json(
             report,
